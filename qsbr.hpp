@@ -33,6 +33,11 @@ public:
     _current.load(std::memory_order_acquire)->push([ptr](){ delete ptr;});
   }
 
+  template<typename T>
+  void deferred_free_array(T* ptr) {
+    _current.load(std::memory_order_acquire)->push([ptr](){ delete [] ptr;});
+  }
+
   void quiescent(const uint64_t tid) {
     const uint64_t mask = 1ul << tid;
     const uint64_t prev = _quiescent.fetch_or(mask, std::memory_order_acq_rel);
