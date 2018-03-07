@@ -26,6 +26,7 @@ template <typename T,
 class hash_set : private Hash, Equal {
 
   static constexpr size_t BUCKET_SIZE = 8;
+  static constexpr uintptr_t LOCK_BIT = 0x01;
 
   struct slot {
     size_t _hash;
@@ -93,6 +94,18 @@ class hash_set : private Hash, Equal {
     }
   };
 
+  /**
+   * Locks a bucket ensuring all further CAS operations fail.
+   */
+  static bucket* lock(std::atomic<bucket*>& ptr) {
+    const uintptr_t result = reinterpret_cast<std::atomic<uintptr_t>*>(&ptr)->fetch_or(LOCK_BIT, std::memory_order_acq_rel);
+    return reinterpret_cast<bucket*>(result);
+  }
+
+  static bucket* strip_lock(std::atomic<bucket*>& ptr) {
+    return reinterpret_cast<bucket*>(reinterpret_cast<uintptr_t>(ptr.load(std::memory_order_acquire)) & ~LOCK_BIT);
+  }
+
 public:
 
   mutable qsbr qs;
@@ -117,7 +130,7 @@ public:
 
   bool find(const T& value, const uint64_t tid) const {
     const size_t hash = Hash::operator()(value);
-    const bucket* const b = _buckets[hash % _modulus].load(std::memory_order_acquire);
+    const bucket* const b = strip_lock(_buckets[hash % _modulus]);
     int result = b->find(value, hash);
     qs.quiescent(tid);
     return result >= 0;
@@ -127,7 +140,7 @@ public:
     while(_rehashing.load(std::memory_order_acquire))
       asm("pause");
     const size_t hash = Hash::operator()(value);
-    bucket* old = _buckets[hash % _modulus].load(std::memory_order_acquire);
+    bucket* old = strip_lock(_buckets[hash % _modulus]);
     const int index = old->find(value, hash);
     if(index == -1 && !old->full()) {
       // copy bucket
@@ -156,7 +169,7 @@ public:
     while(_rehashing.load(std::memory_order_acquire))
       asm("pause");
     const size_t hash = Hash::operator()(value);
-    bucket* old = _buckets[hash % _modulus].load(std::memory_order_acquire);
+    bucket* old = strip_lock(_buckets[hash % _modulus]);
     const int index = old->find(value, hash);
     if(index > 0 && !old->empty()) {
       // copy bucket
@@ -190,19 +203,18 @@ public:
       newb[i].store(new bucket, std::memory_order_relaxed);
     }
     for(size_t i = 0; i < nbuckets; i++) {
-      // TODO: Use a fetch or below to "lock" each bucket.
-      // This ensures pending erasures/insertions are either observered
-      // by this thread or fail.
-      bucket* const b = _buckets[i].load();
+      // This "lock" ensures pending erasures/insertions are either
+      // observered by this thread or fail.
+      bucket* const b = lock(_buckets[i]);
       for(size_t j = 0; j < b->_size ; j++) {
         slot& oldslot = b->_items[j];
         bucket& newbucket = *newb[oldslot._hash % (nbuckets << 1)].load();
         if(newbucket.full())
-          throw 0;
+          throw 0; //TODO: Try Again
         else
           newbucket.insert(oldslot);
       }
-      qs.deferred_free(b);
+      qs.deferred_free(reinterpret_cast<bucket*>(reinterpret_cast<uintptr_t>(b) & ~LOCK_BIT));
     }
     qs.deferred_free_array(_buckets.load());
     //TODO: replace below with CMPXCHG16B
