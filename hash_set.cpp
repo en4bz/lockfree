@@ -18,7 +18,6 @@ static void remove_at(T(&arr)[N], size_t index) {
 
 /**
  * Bucket based hash set with CoW buckets.
- * No rehashing support yet.
  */
 template <typename T,
          typename Hash = std::hash<T>,
@@ -106,13 +105,21 @@ class hash_set : private Hash, Equal {
     return reinterpret_cast<bucket*>(reinterpret_cast<uintptr_t>(ptr.load(std::memory_order_acquire)) & ~LOCK_BIT);
   }
 
-  static uintptr_t zip(const void* const ptr, const size_t modulus) {
+  /**
+   * Creates a compressed pointer containing the log2 of the
+   * modulus and the actual pointer to the bucket array.
+   * -------------------------------------------------------
+   * 63 free 56 log2(modulus) 48      pointer       2 free 0
+   * -------------------------------------------------------
+   */
+  uintptr_t zip(const void* const ptr, const size_t modulus) {
     uintptr_t top = (63ul - __builtin_clzl(modulus)) << 48;
     top |= reinterpret_cast<uintptr_t>(ptr);
-    return top;
+    _top.store(top, std::memory_order_release);
   }
 
-  static void unzip(uintptr_t top, std::atomic<bucket*>*& ptr , size_t& modulus) {
+  void unzip(std::atomic<bucket*>*& ptr , size_t& modulus) const {
+    uintptr_t top = _top.load(std::memory_order_acquire);
     modulus = 1ul << (top >> 48);
     ptr = reinterpret_cast<std::atomic<bucket*>*>(top & ~(0xFFFFul << 48));
   }
@@ -128,14 +135,13 @@ public:
     auto* const buckets = new std::atomic<bucket*>[bcount];
     for(size_t i = 0; i < bcount; i++)
       buckets[i].store(new bucket());
-    uintptr_t top = zip(buckets, bcount);
-    _top.store(top, std::memory_order_relaxed);
+    zip(buckets, bcount);
   }
 
   ~hash_set() {
     size_t modulus;
     std::atomic<bucket*>* buckets;
-    unzip(_top, buckets, modulus);
+    unzip(buckets, modulus);
     for(size_t i = 0; i < modulus; i++) {
       buckets[i].load()->clear();
       delete buckets[i].load();
@@ -147,7 +153,7 @@ public:
     const size_t  hash = Hash::operator()(value);
     size_t modulus;
     std::atomic<bucket*>* buckets;
-    unzip(_top.load(std::memory_order_acquire), buckets, modulus);
+    unzip(buckets, modulus);
     const bucket* const b = strip_lock(buckets[hash % modulus]);
     int result = b->find(value, hash);
     qs.quiescent(tid);
@@ -160,7 +166,7 @@ public:
     const size_t hash = Hash::operator()(value);
     size_t modulus;
     std::atomic<bucket*>* buckets;
-    unzip(_top.load(std::memory_order_acquire), buckets, modulus);
+    unzip(buckets, modulus);
     bucket* old = strip_lock(buckets[hash % modulus]);
     const int index = old->find(value, hash);
     if(index == -1 && !old->full()) {
@@ -192,7 +198,7 @@ public:
     const size_t hash = Hash::operator()(value);
     size_t modulus;
     std::atomic<bucket*>* buckets;
-    unzip(_top.load(std::memory_order_acquire), buckets, modulus);
+    unzip(buckets, modulus);
     bucket* old = strip_lock(buckets[hash % modulus]);
     const int index = old->find(value, hash);
     if(index > 0 && !old->empty()) {
@@ -223,7 +229,7 @@ public:
 
     size_t modulus;
     std::atomic<bucket*>* buckets;
-    unzip(_top.load(std::memory_order_acquire), buckets, modulus);
+    unzip(buckets, modulus);
 
     std::atomic<bucket*>* newb  = new std::atomic<bucket*>[modulus << 1];
     for(size_t i = 0; i < (modulus << 1); i++) {
@@ -244,7 +250,7 @@ public:
       qs.deferred_free(reinterpret_cast<bucket*>(reinterpret_cast<uintptr_t>(b) & ~LOCK_BIT));
     }
     qs.deferred_free_array(buckets);
-    _top.store(zip(newb, modulus << 1), std::memory_order_release);
+    zip(newb, modulus << 1);
     _rehashing.store(false, std::memory_order_release);
     return true;
   }
