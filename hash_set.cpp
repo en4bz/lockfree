@@ -37,14 +37,14 @@ class hash_set : private Hash, Equal {
   };
 
   struct bucket : private Equal {
-    int _size{0};
-    slot _items[BUCKET_SIZE];
+    size_t _size{0};
+    slot   _items[BUCKET_SIZE];
 
     bucket() : _items() {}
     bucket(const bucket&) = default;
 
     int find(const T& value, const size_t hash) const {
-      for(int i = 0; i < _size; i++) {
+      for(size_t i = 0; i < _size; i++) {
         const slot& s = _items[i];
         if(s._hash == hash && s._item && Equal::operator()(*s._item, value))
           return i;
@@ -86,7 +86,7 @@ class hash_set : private Hash, Equal {
     }
 
     void clear() {
-      for(int i = 0; i < _size; i++) {
+      for(size_t i = 0; i < _size; i++) {
         const slot& s = _items[i];
         delete s._item;
       }
@@ -102,35 +102,53 @@ class hash_set : private Hash, Equal {
     return reinterpret_cast<bucket*>(result);
   }
 
-  static bucket* strip_lock(std::atomic<bucket*>& ptr) {
+  static bucket* strip_lock(const std::atomic<bucket*>& ptr) {
     return reinterpret_cast<bucket*>(reinterpret_cast<uintptr_t>(ptr.load(std::memory_order_acquire)) & ~LOCK_BIT);
+  }
+
+  static uintptr_t zip(const void* const ptr, const size_t modulus) {
+    uintptr_t top = (63ul - __builtin_clzl(modulus)) << 48;
+    top |= reinterpret_cast<uintptr_t>(ptr);
+    return top;
+  }
+
+  static void unzip(uintptr_t top, std::atomic<bucket*>*& ptr , size_t& modulus) {
+    modulus = 1ul << (top >> 48);
+    ptr = reinterpret_cast<std::atomic<bucket*>*>(top & ~(0xFFFFul << 48));
   }
 
 public:
 
   mutable qsbr qs;
 
-  std::atomic_bool                   _rehashing;
-  std::atomic<std::atomic<bucket*>*> _buckets;
-  std::atomic<std::size_t>           _modulus;
+  std::atomic_bool      _rehashing;
+  std::atomic_uintptr_t _top;
 
-  hash_set(size_t bcount = 16) : _modulus(bcount) {
-    _buckets.store(new std::atomic<bucket*>[bcount]);
-    for(int i = 0; i < bcount; i++)
-      _buckets[i].store(new bucket());
+  hash_set(size_t bcount = 16) {
+    auto* const buckets = new std::atomic<bucket*>[bcount];
+    for(size_t i = 0; i < bcount; i++)
+      buckets[i].store(new bucket());
+    uintptr_t top = zip(buckets, bcount);
+    _top.store(top, std::memory_order_relaxed);
   }
 
   ~hash_set() {
-    for(int i = 0; i < _modulus.load(); i++) {
-      _buckets[i].load()->clear();
-      delete _buckets[i].load();
+    size_t modulus;
+    std::atomic<bucket*>* buckets;
+    unzip(_top, buckets, modulus);
+    for(size_t i = 0; i < modulus; i++) {
+      buckets[i].load()->clear();
+      delete buckets[i].load();
     }
-    delete [] _buckets.load();
+    delete [] buckets;
   }
 
   bool find(const T& value, const uint64_t tid) const {
-    const size_t hash = Hash::operator()(value);
-    const bucket* const b = strip_lock(_buckets[hash % _modulus]);
+    const size_t  hash = Hash::operator()(value);
+    size_t modulus;
+    std::atomic<bucket*>* buckets;
+    unzip(_top.load(std::memory_order_acquire), buckets, modulus);
+    const bucket* const b = strip_lock(buckets[hash % modulus]);
     int result = b->find(value, hash);
     qs.quiescent(tid);
     return result >= 0;
@@ -140,13 +158,16 @@ public:
     while(_rehashing.load(std::memory_order_acquire))
       asm("pause");
     const size_t hash = Hash::operator()(value);
-    bucket* old = strip_lock(_buckets[hash % _modulus]);
+    size_t modulus;
+    std::atomic<bucket*>* buckets;
+    unzip(_top.load(std::memory_order_acquire), buckets, modulus);
+    bucket* old = strip_lock(buckets[hash % modulus]);
     const int index = old->find(value, hash);
     if(index == -1 && !old->full()) {
       // copy bucket
       bucket* copy = prealloc ? new (prealloc) bucket(*old) : new bucket(*old);
       T* const new_elem = copy->insert(value, hash);
-      if(_buckets[hash % _modulus].compare_exchange_strong(old, copy, std::memory_order_acq_rel)) {
+      if(buckets[hash % modulus].compare_exchange_strong(old, copy, std::memory_order_acq_rel)) {
         qs.deferred_free(old);
       }
       else {
@@ -169,13 +190,16 @@ public:
     while(_rehashing.load(std::memory_order_acquire))
       asm("pause");
     const size_t hash = Hash::operator()(value);
-    bucket* old = strip_lock(_buckets[hash % _modulus]);
+    size_t modulus;
+    std::atomic<bucket*>* buckets;
+    unzip(_top.load(std::memory_order_acquire), buckets, modulus);
+    bucket* old = strip_lock(buckets[hash % modulus]);
     const int index = old->find(value, hash);
     if(index > 0 && !old->empty()) {
       // copy bucket
       bucket* copy = prealloc ? new (prealloc) bucket(*old) : new bucket(*old);
       T* old_elem = copy->remove(index);
-      if(_buckets[hash % _modulus].compare_exchange_strong(old, copy, std::memory_order_acq_rel)) {
+      if(buckets[hash % modulus].compare_exchange_strong(old, copy, std::memory_order_acq_rel)) {
         qs.deferred_free(old);
         qs.deferred_free(old_elem);
       }
@@ -191,24 +215,27 @@ public:
   }
 
   bool rehash() {
-    bool prev = _rehashing.exchange(true);
+    bool prev = _rehashing.exchange(true, std::memory_order_acq_rel);
     if(prev)
       return false; // someone is already rehashing
     else
       write(1, "rehash\n", 8);
-    //auto* const buckets = _buckets.load();
-    const size_t nbuckets  = _modulus.load();
-    std::atomic<bucket*>* newb  = new std::atomic<bucket*>[nbuckets << 1];
-    for(size_t i = 0; i < (nbuckets << 1); i++) {
+
+    size_t modulus;
+    std::atomic<bucket*>* buckets;
+    unzip(_top.load(std::memory_order_acquire), buckets, modulus);
+
+    std::atomic<bucket*>* newb  = new std::atomic<bucket*>[modulus << 1];
+    for(size_t i = 0; i < (modulus << 1); i++) {
       newb[i].store(new bucket, std::memory_order_relaxed);
     }
-    for(size_t i = 0; i < nbuckets; i++) {
+    for(size_t i = 0; i < modulus; i++) {
       // This "lock" ensures pending erasures/insertions are either
       // observered by this thread or fail.
-      bucket* const b = lock(_buckets[i]);
+      bucket* const b = lock(buckets[i]);
       for(size_t j = 0; j < b->_size ; j++) {
         slot& oldslot = b->_items[j];
-        bucket& newbucket = *newb[oldslot._hash % (nbuckets << 1)].load();
+        bucket& newbucket = *newb[oldslot._hash % (modulus << 1)].load();
         if(newbucket.full())
           throw 0; //TODO: Try Again
         else
@@ -216,11 +243,10 @@ public:
       }
       qs.deferred_free(reinterpret_cast<bucket*>(reinterpret_cast<uintptr_t>(b) & ~LOCK_BIT));
     }
-    qs.deferred_free_array(_buckets.load());
-    //TODO: replace below with CMPXCHG16B
-    _buckets.store(newb);
-    _modulus.store(nbuckets << 1);
-    _rehashing.store(false);
+    qs.deferred_free_array(buckets);
+    _top.store(zip(newb, modulus << 1), std::memory_order_release);
+    _rehashing.store(false, std::memory_order_release);
+    return true;
   }
 };
 
@@ -234,7 +260,7 @@ std::atomic_int spin(0);
 std::atomic_int found(0);
 
 void foo(const int seed) {
-  const int N = 1000;
+  const int N = 1000000;
   const uint64_t tid = sss.qs.register_thread();
   spin--;
   while(spin.load());
