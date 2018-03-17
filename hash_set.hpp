@@ -3,7 +3,7 @@
 #include <cstring>
 #include <unistd.h>
 #include <x86intrin.h>
-#include <iostream>
+#include <type_traits>
 
 template<typename T, size_t N>
 static void insert_at(T(&arr)[N], size_t index, T value) {
@@ -20,32 +20,35 @@ static void remove_at(T(&arr)[N], size_t index) {
  * Bucket based hash set with CoW buckets.
  */
 template <typename T,
+         size_t BUCKET_SIZE = 8,
          typename Hash = std::hash<T>,
          typename Equal = std::equal_to<T>>
 class hash_set : private Hash, Equal {
 
-  static constexpr size_t BUCKET_SIZE = 8;
+  static_assert(std::is_trivially_copyable<T>::value, "T must be trivially_copyable!");
+  static_assert(std::is_trivially_destructible<T>::value, "T must be trivially_destructible!");
+//  static constexpr size_t BUCKET_SIZE = 8;
   static constexpr uintptr_t LOCK_BIT = 0x01;
 
   struct slot {
     size_t _hash;
-    T*     _item;
+    T      _item;
 
-    slot(size_t h = 0, T* i = nullptr) : _hash(h), _item(i) {}
+    slot(size_t h = 0, T i = T()) : _hash(h), _item(i) {}
     slot(const slot& copy) = default;
   };
 
   struct bucket : private Equal {
-    size_t _size{0};
-    slot   _items[BUCKET_SIZE];
+    unsigned _size{0};
+    slot     _items[BUCKET_SIZE];
 
     bucket() : _items() {}
     bucket(const bucket&) = default;
 
     int find(const T& value, const size_t hash) const {
-      for(size_t i = 0; i < _size; i++) {
+      for(unsigned i = 0; i < _size; i++) {
         const slot& s = _items[i];
-        if(s._hash == hash && s._item && Equal::operator()(*s._item, value))
+        if(s._hash == hash && Equal::operator()(s._item, value))
           return i;
       }
       return -1;
@@ -63,21 +66,13 @@ class hash_set : private Hash, Equal {
       _items[_size++] = s;
     }
 
-    T* insert(T* const value, const size_t hash) {
+    void insert(const T value, const size_t hash) {
       _items[_size++] = slot{hash, value};
-      return value;
     }
 
-    T* insert(const T& value, const size_t hash) {
-      T* v = new T(value);
-      return insert(v, hash);
-    }
-
-    T* remove(const int index) {
-      T* old = _items[index]._item;
+    void remove(const int index) {
       remove_at(_items, index);
-      _items[--_size] = slot();
-      return old;
+      --_size;
     }
 
     void reset() noexcept {
@@ -85,10 +80,6 @@ class hash_set : private Hash, Equal {
     }
 
     void clear() {
-      for(size_t i = 0; i < _size; i++) {
-        const slot& s = _items[i];
-        delete s._item;
-      }
       _size = 0;
     }
   };
@@ -112,7 +103,7 @@ class hash_set : private Hash, Equal {
    * 63 free 56 log2(modulus) 48      pointer       2 free 0
    * -------------------------------------------------------
    */
-  uintptr_t zip(const void* const ptr, const size_t modulus) {
+  void zip(const void* const ptr, const size_t modulus) {
     uintptr_t top = (63ul - __builtin_clzl(modulus)) << 48;
     top |= reinterpret_cast<uintptr_t>(ptr);
     _top.store(top, std::memory_order_release);
@@ -156,7 +147,8 @@ public:
     unzip(buckets, modulus);
     const bucket* const b = strip_lock(buckets[hash % modulus]);
     int result = b->find(value, hash);
-    qs.quiescent(tid);
+    if(result == 4)
+      qs.quiescent(tid);
     return result >= 0;
   }
 
@@ -172,12 +164,11 @@ public:
     if(index == -1 && !old->full()) {
       // copy bucket
       bucket* copy = prealloc ? new (prealloc) bucket(*old) : new bucket(*old);
-      T* const new_elem = copy->insert(value, hash);
+      copy->insert(value, hash);
       if(buckets[hash % modulus].compare_exchange_strong(old, copy, std::memory_order_acq_rel)) {
         qs.deferred_free(old);
       }
       else {
-        delete new_elem; // TODO: reuse this
         return insert(value, tid, copy);
       }
     }
@@ -201,13 +192,12 @@ public:
     unzip(buckets, modulus);
     bucket* old = strip_lock(buckets[hash % modulus]);
     const int index = old->find(value, hash);
-    if(index > 0 && !old->empty()) {
+    if(index >= 0 && !old->empty()) {
       // copy bucket
       bucket* copy = prealloc ? new (prealloc) bucket(*old) : new bucket(*old);
-      T* old_elem = copy->remove(index);
+      copy->remove(index);
       if(buckets[hash % modulus].compare_exchange_strong(old, copy, std::memory_order_acq_rel)) {
         qs.deferred_free(old);
-        qs.deferred_free(old_elem);
       }
       else {
         return erase(value, tid, copy);
@@ -217,7 +207,7 @@ public:
       delete prealloc;
 
     qs.quiescent(tid);
-    return index > 0;
+    return index >= 0;
   }
 
   bool rehash() {
@@ -255,47 +245,3 @@ public:
     return true;
   }
 };
-
-#include <random>
-#include <vector>
-#include <thread>
-
-static hash_set<long> sss;
-
-std::atomic_int spin(0);
-std::atomic_int found(0);
-
-void foo(const int seed) {
-  const int N = 1000000;
-  const uint64_t tid = sss.qs.register_thread();
-  spin--;
-  while(spin.load());
-
-  if(tid % 2 == 0) {
-    for(int i = 0; i < N; i++)
-      sss.insert(i, tid);
-    for(int i = 0; i < N; i++)
-      found += sss.find(i, tid);
-  }
-  else {
-    for(int i = 0; i < N; i++)
-      found += sss.find(i, tid);
-    for(int i = 0; i < N; i++)
-      sss.erase(i, tid);
-  }
-}
-
-int main(int argc, char** argv) {
-  if(argc != 2)
-    return 2;
-
-  const int n = atoi(argv[1]);
-  spin.store(n);
-  std::vector<std::thread> threads;
-  for(int i = 1; i <= n; i++) {
-    threads.emplace_back(foo, i);
-  }
-  for(auto& t : threads)
-    t.join();
-  std::cout << found << std::endl;
-}
