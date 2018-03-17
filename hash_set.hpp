@@ -1,15 +1,9 @@
+#pragma once
+
 #include "qsbr.hpp"
 
 #include <cstring>
-#include <unistd.h>
-#include <x86intrin.h>
 #include <type_traits>
-
-template<typename T, size_t N>
-static void insert_at(T(&arr)[N], size_t index, T value) {
-  std::memmove(arr + index + 1, arr + index, sizeof(T) * (N - index - 1));
-  arr[index] = value;
-}
 
 template<typename T, size_t N>
 static void remove_at(T(&arr)[N], size_t index) {
@@ -20,14 +14,14 @@ static void remove_at(T(&arr)[N], size_t index) {
  * Bucket based hash set with CoW buckets.
  */
 template <typename T,
-         size_t BUCKET_SIZE = 8,
+         unsigned BUCKET_SIZE = 8,
          typename Hash = std::hash<T>,
          typename Equal = std::equal_to<T>>
 class hash_set : private Hash, Equal {
 
   static_assert(std::is_trivially_copyable<T>::value, "T must be trivially_copyable!");
   static_assert(std::is_trivially_destructible<T>::value, "T must be trivially_destructible!");
-//  static constexpr size_t BUCKET_SIZE = 8;
+
   static constexpr uintptr_t LOCK_BIT = 0x01;
 
   struct slot {
@@ -62,21 +56,17 @@ class hash_set : private Hash, Equal {
       return _size == 0;
     }
 
-    void insert(const slot& s) noexcept {
+    void insert(const slot& s) {
       _items[_size++] = s;
     }
 
-    void insert(const T value, const size_t hash) {
+    void insert(const T& value, const size_t hash) {
       _items[_size++] = slot{hash, value};
     }
 
     void remove(const int index) {
       remove_at(_items, index);
       --_size;
-    }
-
-    void reset() noexcept {
-      _size = 0;
     }
 
     void clear() {
@@ -134,7 +124,6 @@ public:
     std::atomic<bucket*>* buckets;
     unzip(buckets, modulus);
     for(size_t i = 0; i < modulus; i++) {
-      buckets[i].load()->clear();
       delete buckets[i].load();
     }
     delete [] buckets;
@@ -214,8 +203,6 @@ public:
     bool prev = _rehashing.exchange(true, std::memory_order_acq_rel);
     if(prev)
       return false; // someone is already rehashing
-    else
-      write(1, "rehash\n", 8);
 
     size_t modulus;
     std::atomic<bucket*>* buckets;

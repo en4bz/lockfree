@@ -13,6 +13,7 @@ class qsbr {
   uint64_t _pad1[6];
   std::atomic<mpsc_queue<std::function<void()>>*> _current;
   std::atomic<mpsc_queue<std::function<void()>>*> _previous;
+  uint64_t _pad2[6];
 
 public:
 
