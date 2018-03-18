@@ -45,4 +45,7 @@ public:
     return false;
   }
 
+  ~mpsc_queue() {
+    delete _head.load();
+  }
 };
