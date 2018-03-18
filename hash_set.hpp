@@ -78,10 +78,6 @@ class hash_set : private Hash, Equal {
 
   static_assert(std::is_trivially_copyable<bucket>::value, "Bucket is not TC!");
 
-  static bucket* make_bucket() {
-    return new(std::malloc(sizeof(bucket))) bucket;
-  }
-
   /**
    * Locks a bucket ensuring all further CAS operations fail.
    */
@@ -115,7 +111,7 @@ class hash_set : private Hash, Equal {
 
 public:
 
-  mutable qsbr<> qs;
+  mutable qsbr<bucket> qs;
 
   std::atomic_bool      _rehashing;
   std::atomic_uintptr_t _top;
@@ -124,7 +120,7 @@ public:
     using bucket_ptr_t = std::atomic<bucket*>*;
     auto* const buckets = static_cast<bucket_ptr_t>(std::calloc(sizeof(bucket_ptr_t), bcount));
     for(size_t i = 0; i < bcount; i++)
-      buckets[i].store(make_bucket());
+      buckets[i].store(new bucket);
     zip(buckets, bcount);
   }
 
@@ -133,7 +129,7 @@ public:
     std::atomic<bucket*>* buckets;
     unzip(buckets, modulus);
     for(size_t i = 0; i < modulus; i++) {
-      std::free(buckets[i].load());
+      delete buckets[i].load();
     }
     free(buckets);
   }
@@ -162,12 +158,10 @@ public:
     const int index = old->find(value, hash);
     if(index == -1 && !old->full()) {
       // copy bucket
-      if(!prealloc)
-        prealloc = static_cast<bucket*>(std::malloc(sizeof(bucket)));
-      bucket* copy = new (prealloc) bucket(*old);
+      bucket* copy = prealloc ? new (prealloc) bucket(*old) : new bucket(*old);
       copy->insert(value, hash);
       if(buckets[hash % modulus].compare_exchange_strong(old, copy, std::memory_order_acq_rel)) {
-        qs.deferred_free(old);
+        qs.deferred_delete(old);
       }
       else {
         return insert(value, tid, copy);
@@ -178,7 +172,7 @@ public:
       return insert(value, tid, prealloc);
     }
     else
-      std::free(prealloc);
+      delete prealloc;
 
     qs.quiescent(tid);
     return false;
@@ -195,19 +189,17 @@ public:
     const int index = old->find(value, hash);
     if(index >= 0) {
       // copy bucket
-      if(!prealloc)
-        prealloc = static_cast<bucket*>(std::malloc(sizeof(bucket)));
-      bucket* copy = new (prealloc) bucket(*old);
+      bucket* copy = prealloc ? new (prealloc) bucket(*old) : new bucket(*old);
       copy->remove(index);
       if(buckets[hash % modulus].compare_exchange_strong(old, copy, std::memory_order_acq_rel)) {
-        qs.deferred_free(old);
+        qs.deferred_delete(old);
       }
       else {
         return erase(value, tid, copy);
       }
     }
     else
-      std::free(prealloc);
+      delete prealloc;
 
     qs.quiescent(tid);
     return index >= 0;
@@ -225,7 +217,7 @@ public:
     using bucket_ptr_t = std::atomic<bucket*>*;
     auto* const newb = static_cast<bucket_ptr_t>(std::calloc(sizeof(bucket_ptr_t), modulus << 1));
     for(size_t i = 0; i < (modulus << 1); i++) {
-      newb[i].store(make_bucket(), std::memory_order_relaxed);
+      newb[i].store(new bucket, std::memory_order_relaxed);
     }
     for(size_t i = 0; i < modulus; i++) {
       // This "lock" ensures pending erasures/insertions are either
@@ -239,7 +231,7 @@ public:
         else
           newbucket.insert(oldslot);
       }
-      qs.deferred_free(reinterpret_cast<bucket*>(reinterpret_cast<uintptr_t>(b) & ~LOCK_BIT));
+      qs.deferred_delete(reinterpret_cast<bucket*>(reinterpret_cast<uintptr_t>(b) & ~LOCK_BIT));
     }
     qs.deferred_free(buckets);
     zip(newb, modulus << 1);
