@@ -6,11 +6,12 @@
 #include <iostream>
 #include <iomanip>
 #include <chrono>
+#include <x86intrin.h>
 
-static hash_set<int> sss(1 << 16);
+static hash_set<long> sss(1 << 16);
 
-std::atomic_int spin(0);
-volatile int found(0);
+static std::atomic_int spin(0);
+static volatile int found(0);
 
 using namespace std::chrono;
 
@@ -34,27 +35,24 @@ void foo(const int seed) {
 
   for(int i = 0; i < N; i++) {
     const int a = rand(gen);
-    const auto start = high_resolution_clock::now();
+    const long start = __rdtsc();
     if(a < 80) {
       found += sss.find(i, tid);
-      auto end = high_resolution_clock::now();
-      sumf += (end - start).count();
+      sumf += __rdtsc() - start;
       countf += 1.0;
     }
     else if(a < 90) {
       sss.insert(i, tid);
-      auto end = high_resolution_clock::now();
-      sumi += (end - start).count();
+      sumi += __rdtsc() - start;
       counti += 1.0;
     }
     else {
       sss.erase(i, tid);
-      auto end = high_resolution_clock::now();
-      sume += (end - start).count();
+      sume += __rdtsc() - start;
       counte += 1.0;
     }
   }
-  std::cout << std::setprecision(6) << std::right << sumf / countf << ' ' << sumi / counti << ' ' << sume / counte << std::endl;
+  std::cout << std::setprecision(6) << std::right << sumf / countf / 3.5 << ' ' << sumi / counti / 3.5 << ' ' << sume / counte / 3.5 << std::endl;
 }
 
 int main(int argc, char** argv) {
