@@ -115,7 +115,7 @@ class hash_set : private Hash, Equal {
 
 public:
 
-  mutable qsbr_impl<policy::Free> qs;
+  mutable qsbr<> qs;
 
   std::atomic_bool      _rehashing;
   std::atomic_uintptr_t _top;
@@ -241,7 +241,7 @@ public:
       }
       qs.deferred_free(reinterpret_cast<bucket*>(reinterpret_cast<uintptr_t>(b) & ~LOCK_BIT));
     }
-    qs.deferred_free_array(buckets);
+    qs.deferred_free(buckets);
     zip(newb, modulus << 1);
     _rehashing.store(false, std::memory_order_release);
     return true;
