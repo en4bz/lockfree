@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <utility>
 
 template <typename T>
 class mpsc_queue {
@@ -10,6 +11,7 @@ class mpsc_queue {
     T _value;
 
     node(const T& copy = T()) : _next(nullptr), _value(copy) {}
+    node(T&& movable) : _next(nullptr), _value(std::move(movable)) {}
   };
 
   std::atomic<node*> _head;
@@ -21,6 +23,12 @@ public:
 
   void push(const T& value) {
     node* n = new node(value);
+    node* old = _tail.exchange(n, std::memory_order_acq_rel);
+    old->_next.store(n, std::memory_order_release);
+  }
+
+  void push(T&& value) {
+    node* n = new node(std::move(value));
     node* old = _tail.exchange(n, std::memory_order_acq_rel);
     old->_next.store(n, std::memory_order_release);
   }
