@@ -4,22 +4,65 @@
 #include <functional>
 
 #include "mpsc_queue.hpp"
+
+namespace policy {
+
+struct Free {
+  using storage_t = void*;
+
+  static void free(storage_t ptr) {
+    ::free(ptr);
+  }
+
+  static void free_array(storage_t ptr) {
+    ::free(ptr);
+  }
+};
+
+template<typename T>
+struct Delete {
+  using storage_t = T*;
+
+  static void free(storage_t ptr) {
+    delete ptr;
+  }
+
+  static void free_array(storage_t ptr) {
+    delete [] ptr;
+  }
+};
+
+struct Generic {
+  using storage_t = std::function<void()>;
+
+  static void free(storage_t& fn) {
+    fn();
+  }
+
+  static void free_array(storage_t& fn) {
+    fn();
+  }
+};
+
+}
+
 /**
  * Lock-free Quiescent State Based Reclamation.
  */
-class qsbr {
+template<typename Policy>
+class qsbr_impl {
   std::atomic<uint64_t> _counter;
   std::atomic<uint64_t> _quiescent;
   uint64_t _pad1[6];
-  std::atomic<mpsc_queue<std::function<void()>>*> _current;
-  std::atomic<mpsc_queue<std::function<void()>>*> _previous;
+  std::atomic<mpsc_queue<typename Policy::storage_t>*> _current;
+  std::atomic<mpsc_queue<typename Policy::storage_t>*> _previous;
   uint64_t _pad2[6];
 
 public:
 
-  qsbr() : _counter(0), _quiescent(0),
-    _current(new mpsc_queue<std::function<void()>>()),
-    _previous(new mpsc_queue<std::function<void()>>)
+  qsbr_impl() : _counter(0), _quiescent(0),
+    _current( new mpsc_queue<typename Policy::storage_t>()),
+    _previous(new mpsc_queue<typename Policy::storage_t>)
   {}
 
   // Cannot be called after any thread has called quiescent.
@@ -28,15 +71,14 @@ public:
     return _counter.fetch_add(1, std::memory_order_acq_rel);
   }
 
-  template<typename T>
-  void deferred_free(T* ptr) {
-    // SBO should apply to the lambda below so no allocations.
-    _current.load(std::memory_order_acquire)->push([ptr](){ delete ptr;});
+  template<typename U>
+  void deferred_free(U&& ptr) {
+    _current.load(std::memory_order_acquire)->push(std::forward<U>(ptr));
   }
 
-  template<typename T>
-  void deferred_free_array(T* ptr) {
-    _current.load(std::memory_order_acquire)->push([ptr](){ delete [] ptr;});
+  template<typename U>
+  void deferred_free_array(U&& ptr) {
+    _current.load(std::memory_order_acquire)->push(std::forward<U>(ptr));
   }
 
   void quiescent(const uint64_t tid) {
@@ -44,9 +86,9 @@ public:
     const uint64_t prev = _quiescent.fetch_or(mask, std::memory_order_acq_rel);
     if(prev != (prev | mask) && __builtin_popcountl(prev | mask) == _counter) {
       auto* const previous = _previous.load(std::memory_order_acquire);
-      std::function<void()> fn;
+      typename Policy::storage_t fn;
       while(previous->pop(fn))
-        fn();
+        Policy::free(fn);
 
       auto* const temp = _current.exchange(_previous, std::memory_order_acq_rel);
       _previous.store(temp, std::memory_order_release);
@@ -54,11 +96,13 @@ public:
     }
   }
 
-  ~qsbr() {
-    std::function<void()> fn;
+  ~qsbr_impl() {
+    typename Policy::storage_t fn;
     while(_previous.load(std::memory_order_relaxed)->pop(fn))
-      fn();
+      Policy::free(fn);
     while(_current.load(std::memory_order_relaxed)->pop(fn))
-      fn();
+      Policy::free(fn);
   }
 };
+
+using qsbr = qsbr_impl<policy::Generic>;
