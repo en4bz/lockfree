@@ -6,51 +6,19 @@
 
 #include "mpsc_queue.hpp"
 
-namespace detail {
-
-template<typename T, bool b = std::is_array<T>::value>
-struct Delete;
-
-template<typename T>
-struct Delete<T, false> {
-  static void free(void * ptr) {
-    delete static_cast<T*>(ptr);
-  }
-};
-
-template<typename T>
-struct Delete<T, true> {
-  static void free(void * ptr) {
-    delete [] static_cast<T*>(ptr);
-  }
-};
-
-template <typename T, typename... Ts>
-struct Index;
-
-template <typename T, typename... Ts>
-struct Index<T, T, Ts...> : std::integral_constant<std::size_t, 0> {};
-
-template <typename T, typename U, typename... Ts>
-struct Index<T, U, Ts...> : std::integral_constant<std::size_t, 1 + Index<T, Ts...>::value> {};
-
-}
-
 /**
  * Lock-free Quiescent State Based Reclamation.
  */
-template<typename... Args>
 class qsbr {
 
   struct deleter {
     void*  ptr;
-    size_t index;
-  };
+    void (*fn)(void*);
 
-  void do_delete(const deleter& d) {
-    static void(* const deleters[])(void*) = {::free, detail::Delete<Args>::free...};
-    deleters[d.index](d.ptr);
-  }
+    void operator()() const {
+      fn(ptr);
+    }
+  };
 
   std::atomic<uint64_t> _counter;
   std::atomic<uint64_t> _quiescent;
@@ -74,19 +42,21 @@ public:
 
   template<typename T>
   void deferred_free(T* ptr) {
-    deleter d{ptr, 0};
+    deleter d{ptr, ::free};
     _current.load(std::memory_order_acquire)->push(d);
   }
 
   template<typename T>
   void deferred_delete(T* ptr) {
-    deleter d{ptr, detail::Index<T, Args...>::value + 1};
+    static const auto func = [](void* p) { delete static_cast<T*>(p); };
+    deleter d{ptr, func};
     _current.load(std::memory_order_acquire)->push(d);
   }
 
   template<typename T>
   void deferred_delete_array(T* ptr) {
-    deleter d{ptr, detail::Index<T[], Args...>::value + 1};
+    static const auto func = [](void* p) { delete [] static_cast<T*>(p); };
+    deleter d{ptr, func};
     _current.load(std::memory_order_acquire)->push(d);
   }
 
@@ -97,7 +67,7 @@ public:
       auto* const previous = _previous.load(std::memory_order_acquire);
       deleter d;
       while(previous->pop(d))
-        do_delete(d);
+        d();
 
       auto* const temp = _current.exchange(_previous, std::memory_order_acq_rel);
       _previous.store(temp, std::memory_order_release);
@@ -108,9 +78,9 @@ public:
   ~qsbr() {
     deleter d;
     while(_previous.load(std::memory_order_relaxed)->pop(d))
-      do_delete(d);
+      d();
     while(_current.load(std::memory_order_relaxed)->pop(d))
-      do_delete(d);
+      d();
 
     delete _previous.load();
     delete _current.load();

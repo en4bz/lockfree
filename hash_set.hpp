@@ -111,7 +111,7 @@ class hash_set : private Hash, Equal {
 
 public:
 
-  mutable qsbr<bucket> qs;
+  mutable qsbr qs;
 
   std::atomic_bool      _rehashing;
   std::atomic_uintptr_t _top;
