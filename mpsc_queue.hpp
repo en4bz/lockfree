@@ -21,16 +21,18 @@ public:
 
   mpsc_queue() : _head(new node), _tail(_head.load()) {}
 
-  void push(const T& value) {
+  bool push(const T& value) {
     node* n = new node(value);
     node* old = _tail.exchange(n, std::memory_order_acq_rel);
     old->_next.store(n, std::memory_order_release);
+    return true;
   }
 
-  void push(T&& value) {
+  bool push(T&& value) {
     node* n = new node(std::move(value));
     node* old = _tail.exchange(n, std::memory_order_acq_rel);
     old->_next.store(n, std::memory_order_release);
+    return true;
   }
 
   bool pop(T& value) {
@@ -39,7 +41,7 @@ public:
     if(next) {
       _head.store(next);
       delete head;
-      value = next->_value;
+      value = std::move(next->_value);
       return true;
     }
     return false;
