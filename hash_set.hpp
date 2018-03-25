@@ -140,7 +140,8 @@ public:
     size_t modulus;
     std::atomic<bucket*>* buckets;
     unzip(buckets, modulus);
-    const bucket* const b = strip_lock(buckets[hash % modulus]);
+    const size_t bucknum = hash & (modulus - 1);
+    const bucket* const b = strip_lock(buckets[bucknum]);
     int result = b->find(value, hash);
     if(!nonblocking)
       qs.quiescent(tid);
@@ -154,13 +155,14 @@ public:
     size_t modulus;
     std::atomic<bucket*>* buckets;
     unzip(buckets, modulus);
-    bucket* old = strip_lock(buckets[hash % modulus]);
+    const size_t bucknum = hash & (modulus - 1);
+    bucket* old = strip_lock(buckets[bucknum]);
     const int index = old->find(value, hash);
     if(index == -1 && !old->full()) {
       // copy bucket
       bucket* copy = prealloc ? new (prealloc) bucket(*old) : new bucket(*old);
       copy->insert(value, hash);
-      if(buckets[hash % modulus].compare_exchange_strong(old, copy, std::memory_order_acq_rel)) {
+      if(buckets[bucknum].compare_exchange_strong(old, copy, std::memory_order_acq_rel)) {
         qs.deferred_delete(old);
       }
       else {
@@ -185,13 +187,14 @@ public:
     size_t modulus;
     std::atomic<bucket*>* buckets;
     unzip(buckets, modulus);
-    bucket* old = strip_lock(buckets[hash % modulus]);
+    const size_t bucknum = hash & (modulus - 1);
+    bucket* old = strip_lock(buckets[bucknum]);
     const int index = old->find(value, hash);
     if(index >= 0) {
       // copy bucket
       bucket* copy = prealloc ? new (prealloc) bucket(*old) : new bucket(*old);
       copy->remove(index);
-      if(buckets[hash % modulus].compare_exchange_strong(old, copy, std::memory_order_acq_rel)) {
+      if(buckets[bucknum].compare_exchange_strong(old, copy, std::memory_order_acq_rel)) {
         qs.deferred_delete(old);
       }
       else {
@@ -222,10 +225,10 @@ public:
     for(size_t i = 0; i < modulus; i++) {
       // This "lock" ensures pending erasures/insertions are either
       // observered by this thread or fail.
-      bucket* const b = lock(buckets[i]);
+      const bucket* const b = lock(buckets[i]);
       for(size_t j = 0; j < b->_size ; j++) {
         const slot& oldslot = b->operator[](j);
-        bucket& newbucket = *newb[oldslot._hash % (modulus << 1)].load();
+        bucket& newbucket = *newb[oldslot._hash & ((modulus << 1) - 1)].load();
         if(newbucket.full())
           throw 0; //TODO: Try Again
         else
