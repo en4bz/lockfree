@@ -36,10 +36,10 @@ public:
   }
 
   bool pop(T& value) {
-    node* head = _head.load(std::memory_order_acquire);
+    node* head = _head.load(std::memory_order_relaxed);
     node* next = head->_next.load(std::memory_order_acquire);
     if(next) {
-      _head.store(next);
+      _head.store(next, std::memory_order_relaxed);
       delete head;
       value = std::move(next->_value);
       return true;

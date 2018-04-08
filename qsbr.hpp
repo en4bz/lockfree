@@ -40,8 +40,7 @@ public:
     return _counter.fetch_add(1, std::memory_order_acq_rel);
   }
 
-  template<typename T>
-  void deferred_free(T* ptr) {
+  void deferred_free(void* ptr) {
     deleter d{ptr, ::free};
     _current.load(std::memory_order_acquire)->push(d);
   }
