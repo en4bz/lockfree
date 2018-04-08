@@ -1,6 +1,6 @@
 #pragma once
 
-#include "qsbr.hpp"
+#include "gc.hpp"
 
 #include <cstring>
 #include <type_traits>
@@ -33,12 +33,17 @@ class hash_set : private Hash, Equal {
     slot(const slot& copy) = default;
   };
 
-  struct bucket : private Equal {
+  struct bucket : public collectable, private Equal {
     unsigned _size = 0;
     typename std::aligned_storage<sizeof(slot), alignof(slot)>::type _items[BUCKET_SIZE];
 
     bucket() = default;
-    bucket(const bucket&) = default;
+    bucket(const bucket& o) : collectable(), _size(o._size) {
+      for(unsigned i = 0; i < _size; i++)
+        new (_items  + i) slot(o[i]);
+    }
+
+    virtual ~bucket() override {}
 
     int find(const T& value, const size_t hash) const {
       for(unsigned i = 0; i < _size; i++) {
@@ -76,7 +81,7 @@ class hash_set : private Hash, Equal {
 
   };
 
-  static_assert(std::is_trivially_copyable<bucket>::value, "Bucket is not TC!");
+  static_assert(std::is_trivially_copyable<T>::value, "T is not TC!");
 
   /**
    * Locks a bucket ensuring all further CAS operations fail.
